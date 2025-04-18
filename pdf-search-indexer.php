@@ -468,88 +468,17 @@ function index_existing_pdfs() {
     }
 }
 
-// Modify the stop processing function to reset progress
-if (isset($_POST['pdf_search_indexer_stop']) && check_admin_referer('pdf_search_indexer_stop_nonce')) {
-    // Clear any scheduled batch processes
-    wp_clear_scheduled_hook('pdf_search_indexer_batch_process');
-    
-    // Reset any PDFs stuck in processing state
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'processing',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $processing_pdfs = get_posts($args);
-    $count = count($processing_pdfs);
-    
-    if (!empty($processing_pdfs)) {
-        foreach ($processing_pdfs as $pdf) {
-            update_post_meta($pdf->ID, '_pdf_indexing_status', 'pending');
-        }
-    }
-    
-    // Reset progress tracking
-    $progress = array(
-        'current_file' => '',
-        'started_at' => '',
-        'last_update' => current_time('mysql'),
-        'processed_count' => 0,
-        'total_count' => 0,
-        'batch_number' => 0
-    );
-    update_option('pdf_search_indexer_progress', $progress);
-    
-    echo '<div class="notice notice-success"><p>PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.</p></div>';
-}
+// Move this code inside a function that's hooked to an admin action
+// Remove this standalone if block:
+// if (isset($_POST['pdf_search_indexer_stop']) && check_admin_referer('pdf_search_indexer_stop_nonce')) {
+//    ...
+// }
 
-// Add this to the settings page HTML, after the progress bar
-function pdf_search_indexer_settings_html() {
-    if (!current_user_can('manage_options')) {
+// Instead, create a proper function to handle admin POST requests
+function pdf_search_indexer_handle_admin_actions() {
+    // Only run in admin
+    if (!is_admin()) {
         return;
-    }
-    
-    // Handle manual reindex request
-    if (isset($_POST['pdf_search_indexer_reindex']) && check_admin_referer('pdf_search_indexer_reindex_nonce')) {
-        // Mark the first batch of PDFs as "processing" immediately
-        $args = array(
-            'post_type' => 'attachment',
-            'post_mime_type' => 'application/pdf',
-            'posts_per_page' => 5,
-            'post_status' => 'inherit',
-            'meta_query' => array(
-                'relation' => 'OR',
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'compare' => 'NOT EXISTS'
-                ),
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'value' => array('processing', 'completed', 'secured'),
-                    'compare' => 'NOT IN'
-                )
-            )
-        );
-        
-        $pdfs_to_process = get_posts($args);
-        
-        if (!empty($pdfs_to_process)) {
-            foreach ($pdfs_to_process as $pdf) {
-                update_post_meta($pdf->ID, '_pdf_indexing_status', 'processing');
-            }
-        }
-        
-        // Schedule the first batch to run immediately
-        wp_schedule_single_event(time(), 'pdf_search_indexer_batch_process');
-        echo '<div class="notice notice-success"><p>PDF reindexing has been initiated in the background. ' . esc_html(count($pdfs_to_process)) . ' PDFs have been queued for processing. This process will continue automatically and may take some time to complete.</p></div>';
     }
     
     // Handle stop processing request
@@ -581,8 +510,77 @@ function pdf_search_indexer_settings_html() {
             }
         }
         
-        echo '<div class="notice notice-success"><p>PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.</p></div>';
+        // Reset progress tracking
+        $progress = array(
+            'current_file' => '',
+            'started_at' => '',
+            'last_update' => current_time('mysql'),
+            'processed_count' => 0,
+            'total_count' => 0,
+            'batch_number' => 0
+        );
+        update_option('pdf_search_indexer_progress', $progress);
+        
+        add_settings_error(
+            'pdf_search_indexer',
+            'indexing_stopped',
+            'PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.',
+            'success'
+        );
     }
+    
+    // Handle reindex request (move this from settings_html function)
+    if (isset($_POST['pdf_search_indexer_reindex']) && check_admin_referer('pdf_search_indexer_reindex_nonce')) {
+        // Mark the first batch of PDFs as "processing" immediately
+        $args = array(
+            'post_type' => 'attachment',
+            'post_mime_type' => 'application/pdf',
+            'posts_per_page' => 5,
+            'post_status' => 'inherit',
+            'meta_query' => array(
+                'relation' => 'OR',
+                array(
+                    'key' => '_pdf_indexing_status',
+                    'compare' => 'NOT EXISTS'
+                ),
+                array(
+                    'key' => '_pdf_indexing_status',
+                    'value' => array('processing', 'completed', 'secured'),
+                    'compare' => 'NOT IN'
+                )
+            )
+        );
+        
+        $pdfs_to_process = get_posts($args);
+        
+        if (!empty($pdfs_to_process)) {
+            foreach ($pdfs_to_process as $pdf) {
+                update_post_meta($pdf->ID, '_pdf_indexing_status', 'processing');
+            }
+        }
+        
+        // Schedule the first batch to run immediately
+        wp_schedule_single_event(time(), 'pdf_search_indexer_batch_process');
+        
+        add_settings_error(
+            'pdf_search_indexer',
+            'indexing_started',
+            'PDF reindexing has been initiated in the background. ' . esc_html(count($pdfs_to_process)) . ' PDFs have been queued for processing.',
+            'success'
+        );
+    }
+}
+// Hook this function to admin_init
+add_action('admin_init', 'pdf_search_indexer_handle_admin_actions');
+
+// Add this to the settings page HTML, after the progress bar
+function pdf_search_indexer_settings_html() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+    
+    // Display any settings errors/notices
+    settings_errors('pdf_search_indexer');
     
     // Get indexing status
     $args = array(
