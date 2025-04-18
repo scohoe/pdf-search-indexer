@@ -154,15 +154,25 @@ function extract_pdf_text($file_path) {
     
     // Normal processing for regular-sized files
     try {
+        // Set a reasonable memory limit for regular files too
+        ini_set('memory_limit', '256M');
+        
         $parser = new Parser();
         $pdf = $parser->parseFile($file_path);
         $text = $pdf->getText();
+        
+        // Restore original memory limit
+        ini_set('memory_limit', $original_memory_limit);
         
         // Restore original time limit
         set_time_limit($original_time_limit);
         
         return $text;
     } catch (Exception $e) {
+        // Always restore limits even on error
+        ini_set('memory_limit', $original_memory_limit);
+        set_time_limit($original_time_limit);
+        
         error_log("PDF Search Indexer: Error processing file: " . $e->getMessage());
         
         // Check if it's a secured PDF error
