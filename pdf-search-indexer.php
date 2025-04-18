@@ -33,11 +33,61 @@ if (file_exists(__DIR__ . '/vendor/autoload.php')) {
 
 use Smalot\PdfParser\Parser;
 
+// Add a timeout function to prevent hanging
+function timeout_handler() {
+    error_log("PDF Search Indexer: Operation timed out");
+    // Restore PHP settings
+    ini_set('memory_limit', $GLOBALS['original_memory_limit']);
+    set_time_limit($GLOBALS['original_time_limit']);
+    die("PDF processing timed out");
+}
+
+// Add this function to monitor resources during processing
+function check_resources() {
+    $memory_usage = memory_get_usage(true) / (1024 * 1024); // MB
+    $memory_limit = ini_get('memory_limit');
+    
+    // Convert PHP memory limit to MB for comparison
+    if (preg_match('/^(\d+)(.)$/', $memory_limit, $matches)) {
+        $memory_limit = $matches[1];
+        if ($matches[2] == 'G') {
+            $memory_limit *= 1024;
+        }
+    }
+    
+    // If using more than 80% of allowed memory, abort
+    if ($memory_usage > ($memory_limit * 0.8)) {
+        error_log("PDF Search Indexer: Memory usage too high ($memory_usage MB / $memory_limit MB) - Aborting");
+        return false;
+    }
+    
+    return true;
+}
+
 // Function to extract text from PDF
 function extract_pdf_text($file_path) {
+    // Store original limits globally so timeout handler can access them
+    $GLOBALS['original_time_limit'] = ini_get('max_execution_time');
+    $GLOBALS['original_memory_limit'] = ini_get('memory_limit');
+    
+    // Set timeout handler
+    set_time_limit(300); // 5 minutes
+    
+    // Register timeout function with a 4-minute timeout (less than the 5-minute PHP timeout)
+    register_shutdown_function('timeout_handler');
+    $timeout = 240; // 4 minutes
+    
     // Check file size and use alternative approach for large files
     $max_size = get_option('pdf_search_indexer_max_size', 20); // Default 20MB
     $file_size = filesize($file_path) / (1024 * 1024); // Convert to MB
+    
+    // Hard limit - skip extremely large files entirely
+    $hard_limit = 50; // 50MB
+    if ($file_size > $hard_limit) {
+        error_log("PDF Search Indexer: Extremely large file detected ($file_size MB): $file_path - Skipping");
+        $filename = basename($file_path);
+        return "Very large PDF file: $filename\nSize: " . round($file_size, 2) . "MB\nThis file was not indexed due to its extreme size.";
+    }
     
     // Set time limit for processing
     $original_time_limit = ini_get('max_execution_time');
@@ -264,8 +314,18 @@ function index_existing_pdfs() {
         'last_update' => '',
         'processed_count' => 0,
         'total_count' => 0,
-        'batch_number' => 0
+        'batch_number' => 0,
+        'consecutive_errors' => 0 // Add error tracking
     ));
+    
+    // Safety check - if too many consecutive batches with errors
+    if (isset($progress['consecutive_errors']) && $progress['consecutive_errors'] > 5) {
+        error_log("PDF Search Indexer: Too many consecutive errors, stopping batch processing");
+        // Reset error counter but don't schedule next batch
+        $progress['consecutive_errors'] = 0;
+        update_option('pdf_search_indexer_progress', $progress);
+        return;
+    }
     
     // Update batch number
     $progress['batch_number']++;
@@ -320,12 +380,11 @@ function index_existing_pdfs() {
     
     update_option('pdf_search_indexer_progress', $progress);
     
-    // Rest of the function remains the same
     // Process PDFs in smaller batches to avoid timeouts
     $args = array(
         'post_type' => 'attachment',
         'post_mime_type' => 'application/pdf',
-        'posts_per_page' => 2,
+        'posts_per_page' => 1, // Process just one PDF at a time
         'post_status' => 'inherit',
         'meta_query' => array(
             'relation' => 'OR',
@@ -387,9 +446,9 @@ function index_existing_pdfs() {
         }
         
         // Schedule another batch if there are more PDFs to process
-        // MODIFIED: Increase delay between batches to 30 seconds instead of 10
-        if (count($pdf_attachments) >= 2) {
-            wp_schedule_single_event(time() + 30, 'pdf_search_indexer_batch_process');
+        // MODIFIED: Increase delay between batches to 60 seconds instead of 30
+        if (count($pdf_attachments) >= 1) {
+            wp_schedule_single_event(time() + 60, 'pdf_search_indexer_batch_process');
         } else {
             // Reset progress when done
             $progress = get_option('pdf_search_indexer_progress');
