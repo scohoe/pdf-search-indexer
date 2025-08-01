@@ -1,9 +1,10 @@
 === PDF Search Indexer ===
 Contributors: scotthoenes
-Tags: pdf, search, indexing, documents, media
+Donate link: https://github.com/scotthoenes/pdf-search-indexer
+Tags: pdf, search, indexing, documents, media, attachment, file search, content search
 Requires at least: 5.0
-Tested up to: 6.4
-Stable tag: 1.0
+Tested up to: 6.4.2
+Stable tag: 1.0.0
 Requires PHP: 7.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -33,8 +34,16 @@ PDF Search Indexer allows WordPress to search within the content of PDF files up
 
 1. Upload the `pdf-search-indexer` folder to the `/wp-content/plugins/` directory
 2. Activate the plugin through the 'Plugins' menu in WordPress
-3. Install the required PDF Parser library by running `composer require smalot/pdfparser` in the plugin directory
+3. The plugin will automatically check for required dependencies and display instructions if needed
 4. Configure the plugin settings under Settings > PDF Search Indexer
+
+= Manual Installation =
+
+1. Download the plugin zip file
+2. Go to WordPress Admin > Plugins > Add New > Upload Plugin
+3. Choose the zip file and click Install Now
+4. Activate the plugin
+5. Go to Settings > PDF Search Indexer to configure
 
 == Frequently Asked Questions ==
 
@@ -56,10 +65,16 @@ Go to Settings > PDF Search Indexer and click the "Start Indexing" button. The p
 
 == Changelog ==
 
-= 1.0 =
+= 1.0.0 =
 * Initial release
+* Automatic PDF text extraction and indexing
+* Support for large PDF files with optimized processing
+* Password-protected PDF detection
+* Batch processing to prevent timeouts
+* Admin dashboard for monitoring progress
+* WordPress search integration
 
 == Upgrade Notice ==
 
-= 1.0 =
-Initial release
+= 1.0.0 =
+Initial release of PDF Search Indexer. Extract and index text from PDF attachments to make them searchable in WordPress.
