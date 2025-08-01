@@ -33,11 +33,81 @@ if (file_exists(__DIR__ . '/vendor/autoload.php')) {
 
 use Smalot\PdfParser\Parser;
 
+// Add a timeout function to prevent hanging
+if (!function_exists('pdf_search_indexer_timeout_handler')) {
+    function pdf_search_indexer_timeout_handler() {
+    error_log("PDF Search Indexer: Operation timed out");
+    // Restore PHP settings
+    ini_set('memory_limit', $GLOBALS['original_memory_limit']);
+    set_time_limit($GLOBALS['original_time_limit']);
+    die("PDF processing timed out");
+    }
+}
+
+// Add this function to monitor resources during processing
+if (!function_exists('pdf_search_indexer_check_resources')) {
+    function pdf_search_indexer_check_resources() {
+        $memory_usage = memory_get_usage(true) / (1024 * 1024); // MB
+        $memory_limit = ini_get('memory_limit');
+        
+        // Convert PHP memory limit to MB for comparison
+        if (preg_match('/^(\d+)(.)$/', $memory_limit, $matches)) {
+            $memory_limit = $matches[1];
+            if ($matches[2] == 'G') {
+                $memory_limit *= 1024;
+            }
+        }
+        
+        // If using more than 80% of allowed memory, abort
+        if ($memory_usage > ($memory_limit * 0.8)) {
+            error_log("PDF Search Indexer: Memory usage too high ($memory_usage MB / $memory_limit MB) - Aborting");
+            return false;
+        }
+        
+        return true;
+    }
+}
+
 // Function to extract text from PDF
 function extract_pdf_text($file_path) {
+    // Store original limits globally so timeout handler can access them
+    $GLOBALS['original_time_limit'] = ini_get('max_execution_time');
+    $GLOBALS['original_memory_limit'] = ini_get('memory_limit');
+    
+    // Set timeout handler
+    set_time_limit(300); // 5 minutes
+    
+    // Register timeout function with a 4-minute timeout (less than the 5-minute PHP timeout)
+    register_shutdown_function('pdf_search_indexer_timeout_handler');
+    $timeout = 240; // 4 minutes
+    
     // Check file size and use alternative approach for large files
     $max_size = get_option('pdf_search_indexer_max_size', 20); // Default 20MB
     $file_size = filesize($file_path) / (1024 * 1024); // Convert to MB
+    
+    // Hard limit - skip extremely large files entirely
+    $hard_limit = 50; // 50MB
+    if ($file_size > $hard_limit) {
+        error_log("PDF Search Indexer: Extremely large file detected ($file_size MB): $file_path - Skipping");
+        $filename = basename($file_path);
+        $error_message = "Very large PDF file: $filename\nSize: " . round($file_size, 2) . "MB\nThis file was not indexed due to its extreme size.";
+        
+        // Log the error
+        $progress = get_option('pdf_search_indexer_progress');
+        $error_entry = array(
+            'file' => $filename,
+            'error' => 'File too large',
+            'message' => $error_message,
+            'timestamp' => current_time('mysql')
+        );
+        array_unshift($progress['errors'], $error_entry);
+        if (count($progress['errors']) > 50) {
+            $progress['errors'] = array_slice($progress['errors'], 0, 50);
+        }
+        update_option('pdf_search_indexer_progress', $progress);
+
+        return $error_message;
+    }
     
     // Set time limit for processing
     $original_time_limit = ini_get('max_execution_time');
@@ -133,13 +203,27 @@ function extract_pdf_text($file_path) {
             return $text;
         } catch (Exception $e) {
             error_log("PDF Search Indexer: Error processing large file: " . $e->getMessage());
+            $filename = basename($file_path);
+
+            // Log the error
+            $progress = get_option('pdf_search_indexer_progress');
+            $error_entry = array(
+                'file' => $filename,
+                'error' => 'Processing error',
+                'message' => $e->getMessage(),
+                'timestamp' => current_time('mysql')
+            );
+            array_unshift($progress['errors'], $error_entry);
+            if (count($progress['errors']) > 50) {
+                $progress['errors'] = array_slice($progress['errors'], 0, 50);
+            }
+            update_option('pdf_search_indexer_progress', $progress);
             
             // Check if it's a secured PDF error
             if (strpos($e->getMessage(), 'Secured pdf file are currently not supported') !== false) {
                 error_log("PDF Search Indexer: Skipping secured PDF file: $file_path");
                 // Restore original time limit
                 set_time_limit($original_time_limit);
-                $filename = basename($file_path);
                 return "This PDF is password-protected or secured and cannot be indexed. Filename: $filename";
             }
             
@@ -154,23 +238,47 @@ function extract_pdf_text($file_path) {
     
     // Normal processing for regular-sized files
     try {
+        // Set a reasonable memory limit for regular files too
+        ini_set('memory_limit', '256M');
+        
         $parser = new Parser();
         $pdf = $parser->parseFile($file_path);
         $text = $pdf->getText();
+        
+        // Restore original memory limit
+        ini_set('memory_limit', $original_memory_limit);
         
         // Restore original time limit
         set_time_limit($original_time_limit);
         
         return $text;
     } catch (Exception $e) {
+        // Always restore limits even on error
+        ini_set('memory_limit', $original_memory_limit);
+        set_time_limit($original_time_limit);
+        
         error_log("PDF Search Indexer: Error processing file: " . $e->getMessage());
+        $filename = basename($file_path);
+
+        // Log the error
+        $progress = get_option('pdf_search_indexer_progress');
+        $error_entry = array(
+            'file' => $filename,
+            'error' => 'Processing error',
+            'message' => $e->getMessage(),
+            'timestamp' => current_time('mysql')
+        );
+        array_unshift($progress['errors'], $error_entry);
+        if (count($progress['errors']) > 50) {
+            $progress['errors'] = array_slice($progress['errors'], 0, 50);
+        }
+        update_option('pdf_search_indexer_progress', $progress);
         
         // Check if it's a secured PDF error
         if (strpos($e->getMessage(), 'Secured pdf file are currently not supported') !== false) {
             error_log("PDF Search Indexer: Skipping secured PDF file: $file_path");
             // Restore original time limit
             set_time_limit($original_time_limit);
-            $filename = basename($file_path);
             return "This PDF is password-protected or secured and cannot be indexed. Filename: $filename";
         }
         
@@ -198,21 +306,19 @@ function index_pdf_attachments($post_id) {
                 continue;
             }
             
-            // Add status indicator
-            update_post_meta($attachment->ID, '_pdf_indexing_status', 'processing');
+            
             
             $pdf_text = extract_pdf_text($file_path);
             
-            // Store the extracted text in a custom field
-            update_post_meta($attachment->ID, '_pdf_content_index', $pdf_text);
+            // Store the extracted text in the custom table
+            global $wpdb;
+            $table_name = $wpdb->prefix . 'pdf_search_index';
+            $wpdb->replace($table_name, array(
+                'attachment_id' => $attachment->ID,
+                'indexed_content' => $pdf_text
+            ));
             
-            // Update status - mark as secured if needed
-            if (strpos($pdf_text, 'password-protected or secured') !== false) {
-                update_post_meta($attachment->ID, '_pdf_indexing_status', 'secured');
-            } else {
-                update_post_meta($attachment->ID, '_pdf_indexing_status', 'completed');
-            }
-            update_post_meta($attachment->ID, '_pdf_indexed_date', current_time('mysql'));
+            
         }
     }
 }
@@ -220,6 +326,51 @@ function index_pdf_attachments($post_id) {
 // Hook into attachment updates
 add_action('add_attachment', 'index_pdf_attachments');
 add_action('edit_attachment', 'index_pdf_attachments');
+
+// Integrate with WordPress search
+function pdf_search_indexer_search_join($join) {
+    global $wpdb;
+    if (is_search()) {
+        $join .= ' LEFT JOIN ' . $wpdb->prefix . 'pdf_search_index ON ' . $wpdb->posts . '.ID = ' . $wpdb->prefix . 'pdf_search_index.attachment_id';
+    }
+    return $join;
+}
+add_filter('posts_join', 'pdf_search_indexer_search_join');
+
+function pdf_search_indexer_search_where($where) {
+    global $wpdb;
+    if (is_search()) {
+        $where = preg_replace(
+            "/\(\s*" . $wpdb->posts . ".post_title LIKE '([^']*)'\s*\)/",
+            "(" . $wpdb->posts . ".post_title LIKE '$1' OR " . $wpdb->prefix . "pdf_search_index.indexed_content LIKE '$1')", $where
+        );
+    }
+    return $where;
+}
+add_filter('posts_where', 'pdf_search_indexer_search_where');
+
+
+
+// Function to create the custom table
+function pdf_search_indexer_create_table() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'pdf_search_index';
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE $table_name (
+        id mediumint(9) NOT NULL AUTO_INCREMENT,
+        attachment_id bigint(20) NOT NULL,
+        indexed_content longtext NOT NULL,
+        PRIMARY KEY  (id),
+        KEY attachment_id (attachment_id)
+    ) $charset_collate;";
+
+    require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
+    dbDelta($sql);
+}
+
+// Hook to create table on plugin activation
+register_activation_hook(__FILE__, 'pdf_search_indexer_create_table');
 
 // Hook to index existing PDFs on plugin activation
 // After the plugin header, add this new option during activation
@@ -238,6 +389,8 @@ function pdf_search_indexer_activate() {
             'current_file' => '',
             'started_at' => '',
             'last_update' => '',
+            'log' => array(), // Add a log array
+            'errors' => array(), // Add an error log array
             'processed_count' => 0,
             'total_count' => 0,
             'batch_number' => 0
@@ -254,8 +407,18 @@ function index_existing_pdfs() {
         'last_update' => '',
         'processed_count' => 0,
         'total_count' => 0,
-        'batch_number' => 0
+        'batch_number' => 0,
+        'consecutive_errors' => 0 // Add error tracking
     ));
+    
+    // Safety check - if too many consecutive batches with errors
+    if (isset($progress['consecutive_errors']) && $progress['consecutive_errors'] > 5) {
+        error_log("PDF Search Indexer: Too many consecutive errors, stopping batch processing");
+        // Reset error counter but don't schedule next batch
+        $progress['consecutive_errors'] = 0;
+        update_option('pdf_search_indexer_progress', $progress);
+        return;
+    }
     
     // Update batch number
     $progress['batch_number']++;
@@ -266,69 +429,28 @@ function index_existing_pdfs() {
         $progress['started_at'] = current_time('mysql');
         $progress['processed_count'] = 0; // Reset processed count
         
-        // Count total PDFs that need processing
-        $args = array(
-            'post_type' => 'attachment',
-            'post_mime_type' => 'application/pdf',
-            'posts_per_page' => -1,
-            'post_status' => 'inherit',
-            'meta_query' => array(
-                'relation' => 'OR',
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'compare' => 'NOT EXISTS'
-                ),
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'value' => array('completed', 'secured', 'processing'),
-                    'compare' => 'NOT IN'
-                )
-            )
-        );
-        
-        // Also count already processed PDFs to get a true total
-        $completed_args = array(
-            'post_type' => 'attachment',
-            'post_mime_type' => 'application/pdf',
-            'posts_per_page' => -1,
-            'post_status' => 'inherit',
-            'meta_query' => array(
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'value' => array('completed', 'secured'),
-                    'compare' => 'IN'
-                )
-            )
-        );
-        
-        $pending_pdfs = get_posts($args);
-        $completed_pdfs = get_posts($completed_args);
-        
-        $progress['total_count'] = count($pending_pdfs) + count($completed_pdfs);
-        $progress['processed_count'] = count($completed_pdfs); // Start with already completed count
+        // Count total PDFs and already indexed PDFs
+        global $wpdb;
+        $total_pdfs = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_mime_type = 'application/pdf'");
+        $indexed_pdfs_count = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}pdf_search_index");
+
+        $progress['total_count'] = $total_pdfs;
+        $progress['processed_count'] = $indexed_pdfs_count;
     }
     
     update_option('pdf_search_indexer_progress', $progress);
     
-    // Rest of the function remains the same
     // Process PDFs in smaller batches to avoid timeouts
+    // Query for PDFs that are not in the custom index table
+    global $wpdb;
+    $indexed_pdf_ids = $wpdb->get_col("SELECT attachment_id FROM {$wpdb->prefix}pdf_search_index");
+
     $args = array(
         'post_type' => 'attachment',
         'post_mime_type' => 'application/pdf',
-        'posts_per_page' => 2,
+        'posts_per_page' => 1, // Process just one PDF at a time
         'post_status' => 'inherit',
-        'meta_query' => array(
-            'relation' => 'OR',
-            array(
-                'key' => '_pdf_indexing_status',
-                'compare' => 'NOT EXISTS'
-            ),
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'processing',
-                'compare' => '!='
-            )
-        )
+        'post__not_in' => !empty($indexed_pdf_ids) ? $indexed_pdf_ids : array(0), // Use post__not_in to exclude indexed PDFs
     );
 
     $pdf_attachments = get_posts($args);
@@ -353,8 +475,13 @@ function index_existing_pdfs() {
             
             $pdf_text = extract_pdf_text($file_path);
             
-            // Store the extracted text in a custom field
-            update_post_meta($attachment->ID, '_pdf_content_index', $pdf_text);
+            // Store the extracted text in the custom table
+            global $wpdb;
+            $table_name = $wpdb->prefix . 'pdf_search_index';
+            $wpdb->replace($table_name, array(
+                'attachment_id' => $attachment->ID,
+                'indexed_content' => $pdf_text
+            ));
             
             // Update status - mark as secured if needed
             if (strpos($pdf_text, 'password-protected or secured') !== false) {
@@ -364,10 +491,25 @@ function index_existing_pdfs() {
             }
             update_post_meta($attachment->ID, '_pdf_indexed_date', current_time('mysql'));
             
-            // Update progress count
+            // Update progress count and log
             $progress = get_option('pdf_search_indexer_progress');
             $progress['processed_count']++;
             $progress['last_update'] = current_time('mysql');
+
+            $log_entry = array(
+                'file' => basename($file_path),
+                'status' => get_post_meta($attachment->ID, '_pdf_indexing_status', true),
+                'timestamp' => current_time('mysql')
+            );
+
+            // Add to the beginning of the log
+            array_unshift($progress['log'], $log_entry);
+
+            // Keep the log to a reasonable size (e.g., last 50 entries)
+            if (count($progress['log']) > 50) {
+                $progress['log'] = array_slice($progress['log'], 0, 50);
+            }
+
             update_option('pdf_search_indexer_progress', $progress);
             
             // ADDED: Force garbage collection after each PDF to free memory
@@ -377,9 +519,9 @@ function index_existing_pdfs() {
         }
         
         // Schedule another batch if there are more PDFs to process
-        // MODIFIED: Increase delay between batches to 30 seconds instead of 10
-        if (count($pdf_attachments) >= 2) {
-            wp_schedule_single_event(time() + 30, 'pdf_search_indexer_batch_process');
+        // MODIFIED: Increase delay between batches to 60 seconds instead of 30
+        if (count($pdf_attachments) >= 1) {
+            wp_schedule_single_event(time() + 60, 'pdf_search_indexer_batch_process');
         } else {
             // Reset progress when done
             $progress = get_option('pdf_search_indexer_progress');
@@ -399,88 +541,45 @@ function index_existing_pdfs() {
     }
 }
 
-// Modify the stop processing function to reset progress
-if (isset($_POST['pdf_search_indexer_stop']) && check_admin_referer('pdf_search_indexer_stop_nonce')) {
-    // Clear any scheduled batch processes
-    wp_clear_scheduled_hook('pdf_search_indexer_batch_process');
-    
-    // Reset any PDFs stuck in processing state
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'processing',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $processing_pdfs = get_posts($args);
-    $count = count($processing_pdfs);
-    
-    if (!empty($processing_pdfs)) {
-        foreach ($processing_pdfs as $pdf) {
-            update_post_meta($pdf->ID, '_pdf_indexing_status', 'pending');
-        }
-    }
-    
-    // Reset progress tracking
-    $progress = array(
-        'current_file' => '',
-        'started_at' => '',
-        'last_update' => current_time('mysql'),
-        'processed_count' => 0,
-        'total_count' => 0,
-        'batch_number' => 0
-    );
-    update_option('pdf_search_indexer_progress', $progress);
-    
-    echo '<div class="notice notice-success"><p>PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.</p></div>';
-}
+// Move this code inside a function that's hooked to an admin action
+// Remove this standalone if block:
+// if (isset($_POST['pdf_search_indexer_stop']) && check_admin_referer('pdf_search_indexer_stop_nonce')) {
+//    ...
+// }
 
-// Add this to the settings page HTML, after the progress bar
-function pdf_search_indexer_settings_html() {
-    if (!current_user_can('manage_options')) {
-        return;
-    }
-    
-    // Handle manual reindex request
-    if (isset($_POST['pdf_search_indexer_reindex']) && check_admin_referer('pdf_search_indexer_reindex_nonce')) {
-        // Mark the first batch of PDFs as "processing" immediately
-        $args = array(
-            'post_type' => 'attachment',
-            'post_mime_type' => 'application/pdf',
-            'posts_per_page' => 5,
-            'post_status' => 'inherit',
-            'meta_query' => array(
-                'relation' => 'OR',
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'compare' => 'NOT EXISTS'
-                ),
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'value' => array('processing', 'completed', 'secured'),
-                    'compare' => 'NOT IN'
-                )
-            )
-        );
-        
-        $pdfs_to_process = get_posts($args);
-        
-        if (!empty($pdfs_to_process)) {
-            foreach ($pdfs_to_process as $pdf) {
-                update_post_meta($pdf->ID, '_pdf_indexing_status', 'processing');
-            }
-        }
-        
-        // Schedule the first batch to run immediately
+// Instead, create a proper function to handle admin POST requests
+function pdf_search_indexer_handle_admin_actions() {
+    // Handle data migration and re-indexing
+    if (isset($_POST['pdf_search_indexer_migrate_reindex']) && check_admin_referer('pdf_search_indexer_migrate_reindex_nonce')) {
+        global $wpdb;
+
+        // 1. Clear the custom index table
+        $table_name = $wpdb->prefix . 'pdf_search_index';
+        $wpdb->query("TRUNCATE TABLE $table_name");
+
+        // 1.a. Clear out the old post_content from attachments to free up space
+        $wpdb->query("UPDATE {$wpdb->posts} SET post_content = '' WHERE post_type = 'attachment' AND post_mime_type = 'application/pdf'");
+
+        // 2. Delete old post meta data
+        $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_pdf_content_index'");
+
+        // 3. Reset indexing status for all PDFs
+        $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key = '_pdf_indexing_status'");
+
+        // 3. Start the re-indexing process
         wp_schedule_single_event(time(), 'pdf_search_indexer_batch_process');
-        echo '<div class="notice notice-success"><p>PDF reindexing has been initiated in the background. ' . esc_html(count($pdfs_to_process)) . ' PDFs have been queued for processing. This process will continue automatically and may take some time to complete.</p></div>';
+
+        add_settings_error(
+            'pdf_search_indexer',
+            'migration_started',
+            'Old data has been cleared, and re-indexing has started. This may take some time.',
+            'success'
+        );
+    }
+
+    // Only run in admin
+    if (!is_admin()) {
+        return;
     }
     
     // Handle stop processing request
@@ -488,113 +587,53 @@ function pdf_search_indexer_settings_html() {
         // Clear any scheduled batch processes
         wp_clear_scheduled_hook('pdf_search_indexer_batch_process');
         
-        // Reset any PDFs stuck in processing state
-        $args = array(
-            'post_type' => 'attachment',
-            'post_mime_type' => 'application/pdf',
-            'posts_per_page' => -1,
-            'post_status' => 'inherit',
-            'meta_query' => array(
-                array(
-                    'key' => '_pdf_indexing_status',
-                    'value' => 'processing',
-                    'compare' => '='
-                )
-            )
+        $count = 0;
+        
+        // Reset progress tracking
+        $progress = array(
+            'current_file' => '',
+            'started_at' => '',
+            'last_update' => current_time('mysql'),
+            'processed_count' => 0,
+            'total_count' => 0,
+            'batch_number' => 0
         );
+        update_option('pdf_search_indexer_progress', $progress);
         
-        $processing_pdfs = get_posts($args);
-        $count = count($processing_pdfs);
-        
-        if (!empty($processing_pdfs)) {
-            foreach ($processing_pdfs as $pdf) {
-                update_post_meta($pdf->ID, '_pdf_indexing_status', 'pending');
-            }
-        }
-        
-        echo '<div class="notice notice-success"><p>PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.</p></div>';
+        add_settings_error(
+            'pdf_search_indexer',
+            'indexing_stopped',
+            'PDF indexing has been stopped. ' . esc_html($count) . ' PDFs that were being processed have been reset to pending status.',
+            'success'
+        );
     }
     
+    
+}
+// Hook this function to admin_init
+add_action('admin_init', 'pdf_search_indexer_handle_admin_actions');
+
+// Add this to the settings page HTML, after the progress bar
+function pdf_search_indexer_settings_html() {
+    if (!current_user_can('manage_options')) {
+        return;
+    }
+    
+    // Display any settings errors/notices
+    settings_errors('pdf_search_indexer');
+    
     // Get indexing status
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit'
-    );
-    
-    $total_pdfs = count(get_posts($args));
-    
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'completed',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $indexed_pdfs = count(get_posts($args));
-    
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'secured',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $secured_pdfs = count(get_posts($args));
-    
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'processing',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $processing_pdfs = get_posts($args);
-    $processing_count = count($processing_pdfs);
-    
-    // Get pending PDFs (not yet processed)
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => -1,
-        'post_status' => 'inherit',
-        'meta_query' => array(
-            'relation' => 'OR',
-            array(
-                'key' => '_pdf_indexing_status',
-                'compare' => 'NOT EXISTS'
-            ),
-            array(
-                'key' => '_pdf_indexing_status',
-                'value' => 'pending',
-                'compare' => '='
-            )
-        )
-    );
-    
-    $pending_pdfs = count(get_posts($args));
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'pdf_search_index';
+
+    $total_pdfs = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->posts} WHERE post_type = 'attachment' AND post_mime_type = 'application/pdf'");
+    $indexed_pdfs = $wpdb->get_var("SELECT COUNT(*) FROM $table_name");
+    $secured_pdfs = $wpdb->get_var("SELECT COUNT(*) FROM $table_name WHERE indexed_content LIKE '%password-protected or secured%'");
+    $pending_pdfs = $total_pdfs - $indexed_pdfs;
+
+    // Since we are not tracking 'processing' status in the same way, we can estimate it
+    $next_scheduled = wp_next_scheduled('pdf_search_indexer_batch_process');
+    $processing_count = $next_scheduled ? 1 : 0;
     
     // Calculate progress percentage
     $total_to_process = $indexed_pdfs + $secured_pdfs + $processing_count + $pending_pdfs;
@@ -609,7 +648,17 @@ function pdf_search_indexer_settings_html() {
     ?>
     <div class="wrap">
         <h1>PDF Search Indexer Settings</h1>
-        <form action="options.php" method="post">
+        <form method="post" action="">
+    <?php
+    wp_nonce_field('pdf_search_indexer_migrate_reindex_nonce');
+    ?>
+    <p>
+        <button type="submit" name="pdf_search_indexer_migrate_reindex" class="button button-primary">Clean and Re-index All PDFs</button>
+    </p>
+    <p class="description">This will delete all existing indexed PDF data from the postmeta table and start a fresh re-indexing process into the new custom table. This is recommended after updating the plugin.</p>
+</form>
+<hr>
+<form action="options.php" method="post">
             <?php
             settings_fields('pdf_search_indexer_options');
             do_settings_sections('pdf-search-indexer');
@@ -622,20 +671,20 @@ function pdf_search_indexer_settings_html() {
         <h2>Indexing Status</h2>
         
         <div class="pdf-indexer-progress-container" style="margin-bottom: 20px;">
-            <div style="margin-bottom: 5px;">Overall Progress: <?php echo esc_html($progress_percentage); ?>% Complete</div>
+            <div class="progress-text" style="margin-bottom: 5px;">Overall Progress: <?php echo esc_html($progress_percentage); ?>% Complete</div>
             <div style="background-color: #e5e5e5; height: 20px; border-radius: 3px; overflow: hidden;">
-                <div style="background-color: #0073aa; height: 100%; width: <?php echo esc_attr($progress_percentage); ?>%;"></div>
+                <div class="progress-bar" style="background-color: #0073aa; height: 100%; width: <?php echo esc_attr($progress_percentage); ?>%;"></div>
             </div>
         </div>
         
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px;">
             <div>
-                <p>Total PDFs: <?php echo esc_html($total_pdfs); ?></p>
-                <p>Indexed PDFs: <?php echo esc_html($indexed_pdfs); ?></p>
+                <p>Total PDFs: <span id="total-pdfs"><?php echo esc_html($total_pdfs); ?></span></p>
+                <p>Indexed PDFs: <span id="indexed-pdfs"><?php echo esc_html($indexed_pdfs); ?></span></p>
                 <p>Secured PDFs (cannot be indexed): <?php echo esc_html($secured_pdfs); ?></p>
                 <p>Currently Processing: <?php echo esc_html($processing_count); ?></p>
                 <p>Pending PDFs: <?php echo esc_html($pending_pdfs); ?></p>
-                <p>Background Process: <?php echo esc_html($process_status); ?></p>
+                <p>Background Process: <span id="process-status"><?php echo esc_html($process_status); ?></span></p>
                 
                 <?php if ($next_scheduled): ?>
                 <div style="margin-top: 10px; padding: 8px; background: #e7f7ff; border: 1px solid #b0e0ff; border-radius: 3px;">
@@ -671,51 +720,51 @@ function pdf_search_indexer_settings_html() {
                 <?php
                 // Show currently processing file
                 $current_file = !empty($progress['current_file']) ? $progress['current_file'] : 'None';
-                echo '<p><strong>Currently Processing:</strong> ' . esc_html($current_file) . '</p>';
-                
-                // Get recently completed PDFs
-                $args = array(
-                    'post_type' => 'attachment',
-                    'post_mime_type' => 'application/pdf',
-                    'posts_per_page' => 5,
-                    'post_status' => 'inherit',
-                    'meta_query' => array(
-                        array(
-                            'key' => '_pdf_indexing_status',
-                            'value' => array('completed', 'secured'),
-                            'compare' => 'IN'
-                        )
-                    ),
-                    'meta_key' => '_pdf_indexed_date',
-                    'orderby' => 'meta_value',
-                    'order' => 'DESC'
-                );
-                
-                $recent_pdfs = get_posts($args);
-                
-                if (!empty($recent_pdfs)) {
-                    echo '<div style="margin-top: 15px;">';
-                    echo '<h4>Recently Processed Files:</h4>';
-                    echo '<ul style="margin-top: 5px; background: #f8f8f8; padding: 10px; border-radius: 3px;">';
-                    
-                    foreach ($recent_pdfs as $pdf) {
-                        $status = get_post_meta($pdf->ID, '_pdf_indexing_status', true);
-                        $date = get_post_meta($pdf->ID, '_pdf_indexed_date', true);
-                        $formatted_date = !empty($date) ? date_i18n('M j, Y g:i a', strtotime($date)) : 'Unknown';
-                        $status_label = ($status === 'secured') ? 'Secured (Protected)' : 'Completed';
-                        $status_color = ($status === 'secured') ? '#e27730' : '#46b450';
-                        
-                        echo '<li style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #eee;">';
-                        echo '<strong>' . esc_html(basename(get_attached_file($pdf->ID))) . '</strong><br>';
-                        echo '<span style="color: ' . esc_attr($status_color) . '; font-weight: bold;">' . esc_html($status_label) . '</span> - ';
-                        echo '<span style="color: #777; font-size: 12px;">' . esc_html($formatted_date) . '</span>';
-                        echo '</li>';
-                    }
-                    
-                    echo '</ul>';
-                    echo '</div>';
-                }
-                
+                echo '<p><strong>Currently Processing:</strong> <span id="currently-processing">' . esc_html($current_file) . '</span></p>';
+                ?>
+
+                <div style="margin-top: 15px;">
+                    <h4>Processing Log:</h4>
+                    <ul id="processing-log" style="margin-top: 5px; background: #f8f8f8; padding: 10px; border-radius: 3px; max-height: 300px; overflow-y: auto;">
+                        <?php
+                        if (!empty($progress['log'])) {
+                            foreach ($progress['log'] as $log_entry) {
+                                $status_label = ucfirst($log_entry['status']);
+                                $status_color = ($log_entry['status'] === 'secured') ? '#e27730' : (($log_entry['status'] === 'completed') ? '#46b450' : '#0073aa');
+                                echo '<li style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #eee;">';
+                                echo '<strong>' . esc_html($log_entry['file']) . '</strong><br>';
+                                echo '<span style="color: ' . esc_attr($status_color) . '; font-weight: bold;">' . esc_html($status_label) . '</span> - ';
+                                echo '<span style="color: #777; font-size: 12px;">' . esc_html(date_i18n('M j, Y g:i a', strtotime($log_entry['timestamp']))) . '</span>';
+                                echo '</li>';
+                            }
+                        } else {
+                            echo '<li>No processing activity yet.</li>';
+                        }
+                        ?>
+                    </ul>
+                </div>
+
+                <div style="margin-top: 15px;">
+                    <h4>Error Log:</h4>
+                    <ul id="error-log" style="margin-top: 5px; background: #fff0f0; padding: 10px; border-radius: 3px; max-height: 300px; overflow-y: auto;">
+                        <?php
+                        if (!empty($progress['errors'])) {
+                            foreach ($progress['errors'] as $error_entry) {
+                                echo '<li style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid #fcc;">';
+                                echo '<strong>' . esc_html($error_entry['file']) . '</strong><br>';
+                                echo '<span style="color: #d63638; font-weight: bold;">' . esc_html($error_entry['error']) . '</span> - ';
+                                echo '<span style="color: #777; font-size: 12px;">' . esc_html(date_i18n('M j, Y g:i a', strtotime($error_entry['timestamp']))) . '</span><br>';
+                                echo '<small style="color: #555;">' . esc_html($error_entry['message']) . '</small>';
+                                echo '</li>';
+                            }
+                        } else {
+                            echo '<li>No errors recorded.</li>';
+                        }
+                        ?>
+                    </ul>
+                </div>
+                <?php
+
                 // Get PDFs currently in processing state
                 $args = array(
                     'post_type' => 'attachment',
@@ -834,6 +883,27 @@ function pdf_search_indexer_add_settings_page() {
 }
 add_action('admin_menu', 'pdf_search_indexer_add_settings_page');
 
+// Enqueue scripts for the settings page
+function pdf_search_indexer_enqueue_scripts($hook) {
+    if ($hook !== 'settings_page_pdf-search-indexer') {
+        return;
+    }
+    
+    wp_enqueue_script(
+        'pdf-search-indexer-admin',
+        plugin_dir_url(__FILE__) . 'admin.js',
+        array('jquery'),
+        '1.0',
+        true
+    );
+    
+    wp_localize_script('pdf-search-indexer-admin', 'pdfIndexer', array(
+        'ajax_url' => admin_url('admin-ajax.php'),
+        'nonce' => wp_create_nonce('pdf_search_indexer_get_status')
+    ));
+}
+add_action('admin_enqueue_scripts', 'pdf_search_indexer_enqueue_scripts');
+
 // Add settings link on plugin page
 function pdf_search_indexer_settings_link($links) {
     $settings_link = '<a href="options-general.php?page=pdf-search-indexer">Settings</a>';
@@ -842,6 +912,25 @@ function pdf_search_indexer_settings_link($links) {
 }
 $plugin = plugin_basename(__FILE__);
 add_filter("plugin_action_links_$plugin", 'pdf_search_indexer_settings_link');
+
+// AJAX handler to get current status
+function pdf_search_indexer_get_status() {
+    if (!current_user_can('manage_options')) {
+        wp_send_json_error('Permission denied');
+    }
+
+    $progress = get_option('pdf_search_indexer_progress', array());
+    $next_scheduled = wp_next_scheduled('pdf_search_indexer_batch_process');
+    $process_status = $next_scheduled ? 'Active (next batch at ' . gmdate('H:i:s', $next_scheduled) . ')' : 'Inactive';
+
+    $response = array(
+        'progress' => $progress,
+        'process_status' => $process_status
+    );
+
+    wp_send_json_success($response);
+}
+add_action('wp_ajax_pdf_search_indexer_get_status', 'pdf_search_indexer_get_status');
 
 // Register the batch processing hook
 add_action('pdf_search_indexer_batch_process', 'index_existing_pdfs');
