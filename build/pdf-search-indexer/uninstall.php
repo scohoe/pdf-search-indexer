@@ -21,6 +21,7 @@ wp_clear_scheduled_hook( 'pdf_search_indexer_batch_process' );
 // Remove custom post meta for PDF content
 global $wpdb;
 
+// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- Cleanup during uninstall, caching not applicable, meta_key query required for cleanup
 $wpdb->delete(
 	$wpdb->postmeta,
 	array(
@@ -28,6 +29,7 @@ $wpdb->delete(
 	)
 );
 
+// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- Cleanup during uninstall, caching not applicable, meta_key query required for cleanup
 $wpdb->delete(
 	$wpdb->postmeta,
 	array(
@@ -35,6 +37,7 @@ $wpdb->delete(
 	)
 );
 
+// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching,WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- Cleanup during uninstall, caching not applicable, meta_key query required for cleanup
 $wpdb->delete(
 	$wpdb->postmeta,
 	array(

@@ -1,10 +1,10 @@
 === PDF Search Indexer ===
 Contributors: scotthoenes
 Donate link: https://github.com/scotthoenes/pdf-search-indexer
-Tags: pdf, search, indexing, documents, media, attachment, file search, content search
+Tags: pdf, search, indexing, documents, media
 Requires at least: 5.0
-Tested up to: 6.4.2
-Stable tag: 1.0.0
+Tested up to: 6.8
+Stable tag: 1.0.1
 Requires PHP: 7.2
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html

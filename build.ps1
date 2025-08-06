@@ -50,13 +50,38 @@ foreach ($file in $filesToCopy) {
     }
 }
 
-# Check if Composer is available
+# Check if Composer is available (local composer.phar or global)
 $composerAvailable = $false
+$composerCommand = ""
+$vendorExists = Test-Path (Join-Path $pluginDir "vendor")
+
+# Check for global composer first
 try {
     $null = Get-Command composer -ErrorAction Stop
+    $composerCommand = "composer"
     $composerAvailable = $true
+    Write-Host "Using global composer" -ForegroundColor Green
 } catch {
-    Write-Host "Composer not found in PATH" -ForegroundColor Red
+    # Check for local composer.phar with PHP
+    if (Test-Path (Join-Path $pluginDir "composer.phar")) {
+        try {
+            $null = Get-Command php -ErrorAction Stop
+            $composerCommand = "php " + (Join-Path $pluginDir "composer.phar")
+            $composerAvailable = $true
+            Write-Host "Using local composer.phar with PHP" -ForegroundColor Green
+        } catch {
+            Write-Host "PHP not found in PATH, cannot use composer.phar" -ForegroundColor Yellow
+        }
+    }
+    
+    if (-not $composerAvailable) {
+        Write-Host "Composer not available" -ForegroundColor Yellow
+        if ($vendorExists) {
+            Write-Host "Will copy existing vendor directory instead" -ForegroundColor Yellow
+        } else {
+            Write-Host "Warning: No vendor directory found and Composer unavailable" -ForegroundColor Red
+        }
+    }
 }
 
 if ($composerAvailable) {
@@ -68,7 +93,7 @@ if ($composerAvailable) {
     # Install dependencies
     Push-Location $distDir
     try {
-        & composer install --no-dev --optimize-autoloader 2>&1 | Write-Host
+        Invoke-Expression "$composerCommand install --no-dev --optimize-autoloader" 2>&1 | Write-Host
         
         if ($LASTEXITCODE -eq 0) {
             Write-Host "Dependencies installed successfully" -ForegroundColor Green
@@ -87,8 +112,13 @@ if ($composerAvailable) {
         exit 1
     }
     Pop-Location
+} elseif ($vendorExists) {
+    Write-Host "Copying existing vendor directory..." -ForegroundColor Yellow
+    Copy-Item (Join-Path $pluginDir "vendor") (Join-Path $distDir "vendor") -Recurse -Force
+    Copy-Item (Join-Path $pluginDir "composer.json") (Join-Path $distDir "composer.json") -Force
+    Write-Host "Vendor directory copied successfully" -ForegroundColor Green
 } else {
-    Write-Host "Skipping Composer dependencies (Composer not available)" -ForegroundColor Yellow
+    Write-Host "Skipping Composer dependencies (Composer not available and no vendor directory)" -ForegroundColor Yellow
     Write-Host "Note: You'll need to manually install dependencies for the plugin to work" -ForegroundColor Yellow
 }
 
