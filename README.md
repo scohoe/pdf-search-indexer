@@ -101,6 +101,16 @@ Please report bugs and feature requests through the [WordPress Plugin Directory 
 - **Support Forum**: [WordPress.org Support](https://wordpress.org/support/plugin/pdf-search-indexer/)
 - **Issues**: [GitHub Issues](https://github.com/scotthoenes/pdf-search-indexer/issues)
 
+## Donations
+
+If you find this plugin useful and would like to support its development, consider making a donation:
+
+- **Liberapay**: [Support on Liberapay](https://liberapay.com/scohoe/)
+- **Ko-fi**: [Buy me a coffee](https://ko-fi.com/scohoe)
+- **Bitcoin**: `bc1qlsn7hdvmcj9s3fydxexu0elmtvxkqmpamz7azx`
+
+Your support helps maintain and improve this plugin for the WordPress community. Thank you! ❤️
+
 ## Changelog
 
 ### 1.0.0 (2025-01-01)

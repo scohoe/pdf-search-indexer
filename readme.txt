@@ -1,6 +1,6 @@
 === PDF Search Indexer ===
 Contributors: scotthoenes
-Donate link: https://github.com/scotthoenes/pdf-search-indexer
+Donate link: https://liberapay.com/scohoe/
 Tags: pdf, search, indexing, documents, media
 Requires at least: 5.0
 Tested up to: 6.8
@@ -23,6 +23,16 @@ PDF Search Indexer allows WordPress to search within the content of PDF files up
 * Detects and manages password-protected PDFs
 * Provides a dashboard to monitor indexing progress
 * Batch processing to prevent timeouts with large libraries
+
+= Support Development =
+
+If you find this plugin useful, please consider supporting its development:
+
+* [Support on Liberapay](https://liberapay.com/scohoe/)
+* [Buy me a coffee](https://ko-fi.com/scohoe)
+* Bitcoin: bc1qlsn7hdvmcj9s3fydxexu0elmtvxkqmpamz7azx
+
+Your support helps maintain and improve this plugin for the WordPress community!
 
 = Requirements =
 
