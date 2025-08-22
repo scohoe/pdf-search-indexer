@@ -27,7 +27,8 @@ $filesToCopy = @(
     'LICENSE',
     'uninstall.php',
     'admin.js',
-    'languages'
+    'languages',
+    'composer.json'
 )
 
 # Copy files

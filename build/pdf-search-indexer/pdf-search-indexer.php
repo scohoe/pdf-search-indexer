@@ -23,7 +23,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 // Define plugin constants
-define( 'PDF_SEARCH_INDEXER_VERSION', '1.0.0' );
+define( 'PDF_SEARCH_INDEXER_VERSION', '1.0.1' );
 define( 'PDF_SEARCH_INDEXER_PLUGIN_FILE', __FILE__ );
 define( 'PDF_SEARCH_INDEXER_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'PDF_SEARCH_INDEXER_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
@@ -59,9 +59,40 @@ if ( file_exists( PDF_SEARCH_INDEXER_PLUGIN_DIR . 'vendor/autoload.php' ) ) {
 
 use Smalot\PdfParser\Parser;
 
-// Text domain is automatically loaded by WordPress.org for hosted plugins
-
 // Timeout handling removed for WordPress.org compliance
+
+// Lightweight internal logger for plugin (stores messages in progress option)
+if ( ! function_exists( 'pdf_search_indexer_log' ) ) {
+	/**
+	 * Log a message to the plugin's progress store (no trigger_error/error_log).
+	 *
+	 * @param string $message Message to store (sanitized).
+	 * @param string $level   One of: info|notice|warning|error.
+	 */
+	function pdf_search_indexer_log( $message, $level = 'info' ) {
+		$level   = in_array( $level, array( 'info', 'notice', 'warning', 'error' ), true ) ? $level : 'info';
+		$entry   = array(
+			'level'     => $level,
+			'message'   => sanitize_text_field( (string) $message ),
+			'timestamp' => current_time( 'mysql' ),
+		);
+		$progress = get_option( 'pdf_search_indexer_progress' );
+		if ( ! is_array( $progress ) ) {
+			$progress = array();
+		}
+		if ( ! isset( $progress['log'] ) || ! is_array( $progress['log'] ) ) {
+			$progress['log'] = array();
+		}
+		array_unshift( $progress['log'], $entry );
+		if ( count( $progress['log'] ) > 100 ) {
+			$progress['log'] = array_slice( $progress['log'], 0, 100 );
+		}
+		update_option( 'pdf_search_indexer_progress', $progress, false );
+
+		// Allow external listeners to hook into plugin log events without using dev functions
+		do_action( 'pdf_search_indexer_log', $entry );
+	}
+}
 
 // Add this function to monitor resources during processing
 if (!function_exists('pdf_search_indexer_check_resources')) {
@@ -208,7 +239,6 @@ function extract_pdf_text($file_path) {
             }
             
             // Create a basic searchable entry with filename
-            $filename = basename($file_path);
             return "Large PDF file: $filename\nSize: " . round($file_size, 2) . "MB\nThis file was partially indexed due to its size.";
         }
     }
@@ -219,12 +249,19 @@ function extract_pdf_text($file_path) {
         $pdf = $parser->parseFile($file_path);
         $text = $pdf->getText();
         
+        // Explicitly release large objects
+        $pdf = null;
+        $parser = null;
+        if (function_exists('gc_collect_cycles')) { gc_collect_cycles(); }
+        
         return $text;
     } catch (Exception $e) {
         $filename = basename($file_path);
 
         // Log the error
         $progress = get_option('pdf_search_indexer_progress');
+        if (!is_array($progress)) { $progress = array(); }
+        if (!isset($progress['errors']) || !is_array($progress['errors'])) { $progress['errors'] = array(); }
         $error_entry = array(
             'file' => $filename,
             'error' => 'Processing error',
@@ -280,8 +317,38 @@ function index_pdf_attachments($post_id) {
             wp_cache_delete('pdf_search_indexer_stats', 'pdf_search_indexer');
             wp_cache_delete('pdf_search_indexer_counts', 'pdf_search_indexer');
             wp_cache_delete('pdf_search_indexer_indexed_ids', 'pdf_search_indexer');
-            
-            
+            wp_cache_delete('pdf_search_indexer_remaining_id', 'pdf_search_indexer');
+
+            // Reset failure count on success
+            delete_post_meta($attachment->ID, '_pdf_index_failed_count');
+
+            // Update status - mark as secured if needed
+            if (strpos($pdf_text, 'password-protected or secured') !== false) {
+                update_post_meta($attachment->ID, '_pdf_indexing_status', 'secured');
+            } else {
+                update_post_meta($attachment->ID, '_pdf_indexing_status', 'completed');
+            }
+            update_post_meta($attachment->ID, '_pdf_indexed_date', current_time('mysql'));
+
+            // Update progress count and log
+            $progress = get_option('pdf_search_indexer_progress');
+            $progress['processed_count']++;
+            $progress['last_update'] = current_time('mysql');
+            $progress['heartbeat'] = time();
+            $progress['consecutive_errors'] = 0;
+            if (!isset($progress['log']) || !is_array($progress['log'])) {
+                $progress['log'] = array();
+            }
+            $log_entry = array(
+                'file' => basename($file_path),
+                'status' => get_post_meta($attachment->ID, '_pdf_indexing_status', true),
+                'timestamp' => current_time('mysql')
+            );
+            array_unshift($progress['log'], $log_entry);
+            if (count($progress['log']) > 50) {
+                $progress['log'] = array_slice($progress['log'], 0, 50);
+            }
+            update_option('pdf_search_indexer_progress', $progress);
         }
     }
 }
@@ -312,8 +379,6 @@ function pdf_search_indexer_search_where($where) {
 }
 add_filter('posts_where', 'pdf_search_indexer_search_where');
 
-
-
 // Function to create the custom table
 function pdf_search_indexer_create_table() {
     global $wpdb;
@@ -332,12 +397,17 @@ function pdf_search_indexer_create_table() {
     dbDelta($sql);
 }
 
-// Hook to create table on plugin activation
-register_activation_hook(__FILE__, 'pdf_search_indexer_create_table');
+// Combined activation function
+function pdf_search_indexer_activate_plugin() {
+    pdf_search_indexer_create_table();
+    pdf_search_indexer_init_options();
+}
 
-// Hook to index existing PDFs on plugin activation
-// After the plugin header, add this new option during activation
-function pdf_search_indexer_activate() {
+// Register single activation hook
+register_activation_hook(__FILE__, 'pdf_search_indexer_activate_plugin');
+
+// Initialize plugin options
+function pdf_search_indexer_init_options() {
     // Don't run indexing on activation anymore
     // Just set up the plugin options
     if (get_option('pdf_search_indexer_enable_indexing') === false) {
@@ -365,10 +435,18 @@ function pdf_search_indexer_activate() {
 function index_existing_pdfs() {
     // Check database connection health before starting
     global $wpdb;
-    if (!$wpdb || $wpdb->last_error) {
-        error_log('PDF Search Indexer: Database connection issue detected: ' . $wpdb->last_error);
+    if ( !$wpdb || $wpdb->last_error ) {
+        pdf_search_indexer_log( 'Database connection issue detected: ' . ( $wpdb->last_error ? sanitize_text_field( $wpdb->last_error ) : '' ), 'warning' );
         return;
     }
+
+    // Acquire a short-lived lock to avoid concurrent overlapping batches
+    $lock_key = 'pdf_search_indexer_processing_lock';
+    if (get_transient($lock_key)) {
+        // Another batch is in progress or just finished
+        return;
+    }
+    set_transient($lock_key, 1, 120); // 2 minutes
     
     // Get current progress data
     $progress = get_option('pdf_search_indexer_progress', array(
@@ -379,8 +457,13 @@ function index_existing_pdfs() {
         'total_count' => 0,
         'batch_number' => 0,
         'consecutive_errors' => 0, // Add error tracking
-        'heartbeat' => 0
+        'heartbeat' => 0,
+        'errors' => array(),
+        'log' => array(),
     ));
+    if (!is_array($progress)) { $progress = array(); }
+    if (!isset($progress['errors']) || !is_array($progress['errors'])) { $progress['errors'] = array(); }
+    if (!isset($progress['log']) || !is_array($progress['log'])) { $progress['log'] = array(); }
     
     // Update heartbeat at start of processing
     $progress['heartbeat'] = time();
@@ -390,7 +473,8 @@ function index_existing_pdfs() {
         // Reset error counter but don't schedule next batch
         $progress['consecutive_errors'] = 0;
         update_option('pdf_search_indexer_progress', $progress);
-        error_log('PDF Search Indexer: Stopping due to too many consecutive errors');
+        pdf_search_indexer_log( 'Stopping due to too many consecutive errors', 'warning' );
+        delete_transient($lock_key);
         return;
     }
     
@@ -404,7 +488,6 @@ function index_existing_pdfs() {
         $progress['processed_count'] = 0; // Reset processed count
         
         // Count total PDFs and already indexed PDFs with caching
-        global $wpdb;
         $cache_key = 'pdf_search_indexer_counts';
         $counts = wp_cache_get($cache_key, 'pdf_search_indexer');
         
@@ -432,155 +515,215 @@ function index_existing_pdfs() {
     
     update_option('pdf_search_indexer_progress', $progress);
     
-    // Process PDFs in smaller batches to avoid timeouts
-    // Query for PDFs that are not in the custom index table with caching
-    global $wpdb;
-    $cache_key = 'pdf_search_indexer_indexed_ids';
-    $indexed_pdf_ids = wp_cache_get($cache_key, 'pdf_search_indexer');
+    // Process one PDF per batch using efficient query (avoid huge post__not_in lists)
+    $cache_key = 'pdf_search_indexer_next_pdf_id';
+    $next_pdf_id = wp_cache_get($cache_key, 'pdf_search_indexer');
     
-    if (false === $indexed_pdf_ids) {
-        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table query for indexed PDF IDs
-        $indexed_pdf_ids = $wpdb->get_col("SELECT attachment_id FROM {$wpdb->prefix}pdf_search_index");
-        // Cache for 1 minute during processing
-        wp_cache_set($cache_key, $indexed_pdf_ids, 'pdf_search_indexer', 60);
+    if (false === $next_pdf_id) {
+        // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Necessary for batch processing
+        $next_pdf_id = (int) $wpdb->get_var(
+            "SELECT p.ID
+             FROM {$wpdb->posts} p
+             LEFT JOIN {$wpdb->prefix}pdf_search_index i ON i.attachment_id = p.ID
+             WHERE p.post_type = 'attachment' AND p.post_mime_type = 'application/pdf' AND i.attachment_id IS NULL
+             ORDER BY p.ID ASC
+             LIMIT 1"
+        );
+        wp_cache_set($cache_key, $next_pdf_id, 'pdf_search_indexer', 60); // Cache for 60 seconds
     }
 
-    $args = array(
-        'post_type' => 'attachment',
-        'post_mime_type' => 'application/pdf',
-        'posts_per_page' => 1, // Process just one PDF at a time
-        'post_status' => 'inherit',
-        // phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.PostNotIn_post__not_in -- Necessary to exclude already indexed PDFs for incremental processing
-        'post__not_in' => !empty($indexed_pdf_ids) ? $indexed_pdf_ids : array(0), // Use post__not_in to exclude indexed PDFs
-    );
-
-    $pdf_attachments = get_posts($args);
-    
-    if (!empty($pdf_attachments)) {
+    if ($next_pdf_id) {
         $batch_errors = 0;
-        
-        foreach ($pdf_attachments as $attachment) {
-            try {
-                // Check database connection before each operation
-                if ($wpdb->last_error) {
-                    error_log('PDF Search Indexer: Database error detected before processing: ' . $wpdb->last_error);
-                    $batch_errors++;
-                    continue;
-                }
-                
-                $file_path = get_attached_file($attachment->ID);
-                
-                // Skip if file doesn't exist
-                if (!file_exists($file_path)) {
-                    continue;
-                }
-                
-                // Update progress with current file
-                $progress = get_option('pdf_search_indexer_progress');
-                $progress['current_file'] = basename($file_path);
-                $progress['last_update'] = current_time('mysql');
-                update_option('pdf_search_indexer_progress', $progress);
-                
-                // Add status indicator
-                update_post_meta($attachment->ID, '_pdf_indexing_status', 'processing');
-                
-                $pdf_text = extract_pdf_text($file_path);
-                
-                // Store the extracted text in the custom table with error handling
-                $table_name = $wpdb->prefix . 'pdf_search_index';
-                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table operations require direct queries
-                $result = $wpdb->replace($table_name, array(
-                    'attachment_id' => $attachment->ID,
-                    'indexed_content' => $pdf_text
-                ));
-                
-                // Check for database errors after the operation
-                if ($result === false || $wpdb->last_error) {
-                    error_log('PDF Search Indexer: Database error during replace operation: ' . $wpdb->last_error);
-                    $batch_errors++;
-                    
-                    // Reset processing status on error
-                    delete_post_meta($attachment->ID, '_pdf_indexing_status');
-                    continue;
-                }
-                
-                // Invalidate cache after data change
-                wp_cache_delete('pdf_search_indexer_stats', 'pdf_search_indexer');
-                wp_cache_delete('pdf_search_indexer_counts', 'pdf_search_indexer');
-                wp_cache_delete('pdf_search_indexer_indexed_ids', 'pdf_search_indexer');
-                
-                // Update status - mark as secured if needed
-                if (strpos($pdf_text, 'password-protected or secured') !== false) {
-                    update_post_meta($attachment->ID, '_pdf_indexing_status', 'secured');
-                } else {
-                    update_post_meta($attachment->ID, '_pdf_indexing_status', 'completed');
-                }
-                update_post_meta($attachment->ID, '_pdf_indexed_date', current_time('mysql'));
-                
-                // Update progress count and log
-                $progress = get_option('pdf_search_indexer_progress');
-                $progress['processed_count']++;
-                $progress['last_update'] = current_time('mysql');
-                $progress['heartbeat'] = time(); // Update heartbeat on successful processing
-                
-                // Reset consecutive errors on successful processing
-                $progress['consecutive_errors'] = 0;
-                
-                // Initialize log array if it doesn't exist
-                if (!isset($progress['log']) || !is_array($progress['log'])) {
-                    $progress['log'] = array();
-                }
-
-                $log_entry = array(
-                    'file' => basename($file_path),
-                    'status' => get_post_meta($attachment->ID, '_pdf_indexing_status', true),
-                    'timestamp' => current_time('mysql')
-                );
-
-                // Add to the beginning of the log
-                array_unshift($progress['log'], $log_entry);
-
-                // Keep the log to a reasonable size (e.g., last 50 entries)
-                if (count($progress['log']) > 50) {
-                    $progress['log'] = array_slice($progress['log'], 0, 50);
-                }
-
-                update_option('pdf_search_indexer_progress', $progress);
-                
-            } catch (Exception $e) {
-                error_log('PDF Search Indexer: Exception during processing: ' . $e->getMessage());
+        try {
+            if ($wpdb->last_error) {
+                pdf_search_indexer_log( 'Database error detected before processing: ' . ( $wpdb->last_error ? sanitize_text_field( $wpdb->last_error ) : '' ), 'error' );
                 $batch_errors++;
-                
-                // Reset processing status on error
-                delete_post_meta($attachment->ID, '_pdf_indexing_status');
+            } else {
+                $file_path = get_attached_file($next_pdf_id);
+                if ($file_path && file_exists($file_path)) {
+                    // Update progress with current file
+                    $progress = get_option('pdf_search_indexer_progress');
+                    $progress['current_file'] = basename($file_path);
+                    $progress['last_update'] = current_time('mysql');
+                    update_option('pdf_search_indexer_progress', $progress);
+
+                    // Add status indicator
+                    update_post_meta($next_pdf_id, '_pdf_indexing_status', 'processing');
+
+                    $pdf_text = extract_pdf_text($file_path);
+
+                    $table_name = $wpdb->prefix . 'pdf_search_index';
+                    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table operations require direct queries
+                    $result = $wpdb->replace($table_name, array(
+                        'attachment_id' => $next_pdf_id,
+                        'indexed_content' => $pdf_text
+                    ));
+
+                    if ($result === false || $wpdb->last_error) {
+                        pdf_search_indexer_log( 'Database error during replace operation: ' . ( $wpdb->last_error ? sanitize_text_field( $wpdb->last_error ) : '' ), 'error' );
+                        $batch_errors++;
+                        delete_post_meta($next_pdf_id, '_pdf_indexing_status');
+
+                        // Track failure count and, if threshold reached, mark as failed and insert placeholder
+                        $fail_count = (int) get_post_meta($next_pdf_id, '_pdf_index_failed_count', true);
+                        $fail_count++;
+                        update_post_meta($next_pdf_id, '_pdf_index_failed_count', $fail_count);
+                        if ($fail_count >= 3) {
+                            $placeholder = '[ERROR] Database write failed during indexing.';
+                            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table operations require direct queries
+                            $wpdb->replace($table_name, array(
+                                'attachment_id' => $next_pdf_id,
+                                'indexed_content' => $placeholder
+                            ));
+                            wp_cache_delete('pdf_search_indexer_remaining_id', 'pdf_search_indexer');
+                            update_post_meta($next_pdf_id, '_pdf_indexing_status', 'failed');
+                            update_post_meta($next_pdf_id, '_pdf_indexed_date', current_time('mysql'));
+
+                            // Log
+                            $progress = get_option('pdf_search_indexer_progress');
+                            $error_entry = array(
+                                'file' => basename($file_path),
+                                'error' => 'Database error',
+                                'message' => $wpdb->last_error,
+                                'timestamp' => current_time('mysql')
+                            );
+                            array_unshift($progress['errors'], $error_entry);
+                            if (count($progress['errors']) > 50) { $progress['errors'] = array_slice($progress['errors'], 0, 50); }
+                            update_option('pdf_search_indexer_progress', $progress);
+                        }
+                    } else {
+                        // Invalidate cache after data change
+                        wp_cache_delete('pdf_search_indexer_stats', 'pdf_search_indexer');
+                        wp_cache_delete('pdf_search_indexer_counts', 'pdf_search_indexer');
+                        wp_cache_delete('pdf_search_indexer_indexed_ids', 'pdf_search_indexer');
+                        wp_cache_delete('pdf_search_indexer_remaining_id', 'pdf_search_indexer');
+
+                        // Reset failure count on success
+                        delete_post_meta($next_pdf_id, '_pdf_index_failed_count');
+
+                        // Update status - mark as secured if needed
+                        if (strpos($pdf_text, 'password-protected or secured') !== false) {
+                            update_post_meta($next_pdf_id, '_pdf_indexing_status', 'secured');
+                        } else {
+                            update_post_meta($next_pdf_id, '_pdf_indexing_status', 'completed');
+                        }
+                        update_post_meta($next_pdf_id, '_pdf_indexed_date', current_time('mysql'));
+
+                        // Update progress count and log
+                        $progress = get_option('pdf_search_indexer_progress');
+                        $progress['processed_count']++;
+                        $progress['last_update'] = current_time('mysql');
+                        $progress['heartbeat'] = time();
+                        $progress['consecutive_errors'] = 0;
+                        if (!isset($progress['log']) || !is_array($progress['log'])) {
+                            $progress['log'] = array();
+                        }
+                        $log_entry = array(
+                            'file' => basename($file_path),
+                            'status' => get_post_meta($next_pdf_id, '_pdf_indexing_status', true),
+                            'timestamp' => current_time('mysql')
+                        );
+                        array_unshift($progress['log'], $log_entry);
+                        if (count($progress['log']) > 50) {
+                            $progress['log'] = array_slice($progress['log'], 0, 50);
+                        }
+                        update_option('pdf_search_indexer_progress', $progress);
+                    }
+                } else {
+                    // File missing; mark as failed to avoid infinite retries
+                    $table_name = $wpdb->prefix . 'pdf_search_index';
+                    $placeholder = '[ERROR] File missing on disk.';
+                    // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table operations require direct queries
+                    $wpdb->replace($table_name, array(
+                        'attachment_id' => $next_pdf_id,
+                        'indexed_content' => $placeholder
+                    ));
+                    wp_cache_delete('pdf_search_indexer_remaining_id', 'pdf_search_indexer');
+                    update_post_meta($next_pdf_id, '_pdf_indexing_status', 'failed');
+                    update_post_meta($next_pdf_id, '_pdf_indexed_date', current_time('mysql'));
+                }
             }
-            
-            // ADDED: Force garbage collection after each PDF to free memory
-            if (function_exists('gc_collect_cycles')) {
-                gc_collect_cycles();
+        } catch (Exception $e) {
+            pdf_search_indexer_log( 'Exception during processing: ' . sanitize_text_field( $e->getMessage() ), 'error' );
+            $batch_errors++;
+            delete_post_meta($next_pdf_id, '_pdf_indexing_status');
+
+            // Failure count and optional placeholder after 3 tries
+            $fail_count = (int) get_post_meta($next_pdf_id, '_pdf_index_failed_count', true);
+            $fail_count++;
+            update_post_meta($next_pdf_id, '_pdf_index_failed_count', $fail_count);
+            if ($fail_count >= 3) {
+                $table_name = $wpdb->prefix . 'pdf_search_index';
+                $msg = '[ERROR] ' . sanitize_text_field($e->getMessage());
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Custom table operations require direct queries
+                $wpdb->replace($table_name, array(
+                    'attachment_id' => $next_pdf_id,
+                    'indexed_content' => substr($msg, 0, 500)
+                ));
+                wp_cache_delete('pdf_search_indexer_remaining_id', 'pdf_search_indexer');
+                update_post_meta($next_pdf_id, '_pdf_indexing_status', 'failed');
+                update_post_meta($next_pdf_id, '_pdf_indexed_date', current_time('mysql'));
             }
-            
-            // Add small delay between files to reduce database load
-            usleep(100000); // 0.1 second delay
+
+            // Log
+            $progress = get_option('pdf_search_indexer_progress');
+            $error_entry = array(
+                'file' => (string) $next_pdf_id,
+                'error' => 'Exception',
+                'message' => $e->getMessage(),
+                'timestamp' => current_time('mysql')
+            );
+            array_unshift($progress['errors'], $error_entry);
+            if (count($progress['errors']) > 50) { $progress['errors'] = array_slice($progress['errors'], 0, 50); }
+            update_option('pdf_search_indexer_progress', $progress);
         }
-        
+
+        // ADDED: Force garbage collection after each PDF to free memory
+        if (function_exists('gc_collect_cycles')) {
+            gc_collect_cycles();
+        }
+        // Add small delay between files to reduce database load
+        usleep(100000); // 0.1 second delay
+
         // Update consecutive errors count
         if ($batch_errors > 0) {
             $progress = get_option('pdf_search_indexer_progress');
             $progress['consecutive_errors'] = isset($progress['consecutive_errors']) ? $progress['consecutive_errors'] + 1 : 1;
             update_option('pdf_search_indexer_progress', $progress);
-            error_log('PDF Search Indexer: Batch completed with ' . $batch_errors . ' errors');
+            pdf_search_indexer_log( 'Batch completed with ' . intval( $batch_errors ) . ' errors', 'notice' );
         }
-        
+
         // Schedule another batch if there are more PDFs to process
-        // MODIFIED: Increase delay between batches to 60 seconds instead of 30
-        if (count($pdf_attachments) >= 1) {
+        $cache_key = 'pdf_search_indexer_remaining_id';
+        $remaining_id = wp_cache_get($cache_key, 'pdf_search_indexer');
+        
+        if (false === $remaining_id) {
+            // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery -- Necessary for batch processing status
+            $remaining_id = (int) $wpdb->get_var(
+                "SELECT p.ID
+                 FROM {$wpdb->posts} p
+                 LEFT JOIN {$wpdb->prefix}pdf_search_index i ON i.attachment_id = p.ID
+                 WHERE p.post_type = 'attachment' AND p.post_mime_type = 'application/pdf' AND i.attachment_id IS NULL
+                 LIMIT 1"
+            );
+            wp_cache_set($cache_key, $remaining_id, 'pdf_search_indexer', 30); // Cache for 30 seconds
+        }
+
+        if ($remaining_id) {
             // Update heartbeat before scheduling next batch
             $progress = get_option('pdf_search_indexer_progress');
             $progress['heartbeat'] = time();
             update_option('pdf_search_indexer_progress', $progress);
-            
-            wp_schedule_single_event(time() + 60, 'pdf_search_indexer_batch_process');
+
+            // Backoff on consecutive errors
+            $delay = 60;
+            if (!empty($progress['consecutive_errors'])) {
+                $delay = min(300, 60 * (int) $progress['consecutive_errors']); // up to 5 minutes
+            }
+
+            if (!wp_next_scheduled('pdf_search_indexer_batch_process')) {
+                wp_schedule_single_event(time() + $delay, 'pdf_search_indexer_batch_process');
+            }
         } else {
             // Reset progress when done
             $progress = get_option('pdf_search_indexer_progress');
@@ -599,6 +742,9 @@ function index_existing_pdfs() {
         $progress['last_update'] = current_time('mysql');
         update_option('pdf_search_indexer_progress', $progress);
     }
+
+    // Release lock
+    delete_transient($lock_key);
 }
 
 // Move this code inside a function that's hooked to an admin action
@@ -1085,7 +1231,7 @@ function pdf_search_indexer_watchdog() {
     
     $current_time = time();
     $last_heartbeat = $progress['heartbeat'];
-    $stall_threshold = 300; // 5 minutes
+    $stall_threshold = 180; // 3 minutes for faster recovery
     
     // Check if process has stalled (no heartbeat for more than threshold)
     if (($current_time - $last_heartbeat) > $stall_threshold) {
@@ -1094,27 +1240,29 @@ function pdf_search_indexer_watchdog() {
         
         if (!$next_scheduled) {
             // Process has stalled and no event is scheduled - restart it
-            error_log('PDF Search Indexer: Watchdog detected stalled process, restarting...');
+            pdf_search_indexer_log( 'Watchdog detected stalled process, restarting...', 'notice' );
             
             // Clear any existing scheduled events first
             wp_clear_scheduled_hook('pdf_search_indexer_batch_process');
             
             // Check if there are still PDFs to process
             global $wpdb;
-            $indexed_pdf_ids = $wpdb->get_col("SELECT attachment_id FROM {$wpdb->prefix}pdf_search_index");
+            // Attempt to use object cache to avoid repeated direct queries
+            $remaining_cache_key = 'pdf_search_indexer_remaining_id';
+            $remaining_id = wp_cache_get( $remaining_cache_key, 'pdf_search_indexer' );
+            if ( false === $remaining_id ) {
+                // phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- Read-only check on core and custom table with object cache
+                $remaining_id = (int) $wpdb->get_var(
+                    "SELECT p.ID
+                     FROM {$wpdb->posts} p
+                     LEFT JOIN {$wpdb->prefix}pdf_search_index i ON i.attachment_id = p.ID
+                     WHERE p.post_type = 'attachment' AND p.post_mime_type = 'application/pdf' AND i.attachment_id IS NULL
+                     LIMIT 1"
+                );
+                wp_cache_set( $remaining_cache_key, $remaining_id, 'pdf_search_indexer', 60 );
+            }
             
-            $args = array(
-                'post_type' => 'attachment',
-                'post_mime_type' => 'application/pdf',
-                'posts_per_page' => 1,
-                'post_status' => 'inherit',
-                'post__not_in' => !empty($indexed_pdf_ids) ? $indexed_pdf_ids : array(0),
-                'fields' => 'ids'
-            );
-            
-            $remaining_pdfs = get_posts($args);
-            
-            if (!empty($remaining_pdfs)) {
+            if ($remaining_id) {
                 // Restart the process
                 wp_schedule_single_event(time() + 30, 'pdf_search_indexer_batch_process');
                 
@@ -1150,26 +1298,37 @@ function pdf_search_indexer_watchdog() {
     }
 }
 
-// Hook watchdog to run every 5 minutes
+// Hook watchdog to run on a custom 5-minute interval
 add_action('pdf_search_indexer_watchdog', 'pdf_search_indexer_watchdog');
 
-// Schedule watchdog if not already scheduled
-if (!wp_next_scheduled('pdf_search_indexer_watchdog')) {
-    wp_schedule_event(time(), 'hourly', 'pdf_search_indexer_watchdog');
+// Schedule watchdog on init so that schedules are registered
+function pdf_search_indexer_schedule_watchdog_event() {
+    if (!wp_next_scheduled('pdf_search_indexer_watchdog')) {
+        wp_schedule_event(time(), 'every_five_minutes', 'pdf_search_indexer_watchdog');
+    }
 }
+add_action('init', 'pdf_search_indexer_schedule_watchdog_event');
 
 // Register activation hook
-register_activation_hook(__FILE__, 'pdf_search_indexer_activate');
+
 
 // Clear scheduled events on plugin deactivation
 function pdf_search_indexer_deactivate() {
     wp_clear_scheduled_hook('pdf_search_indexer_batch_process');
+    wp_clear_scheduled_hook('pdf_search_indexer_watchdog');
 }
 register_deactivation_hook(__FILE__, 'pdf_search_indexer_deactivate');
 
-// Add custom cron schedule for Greenshift plugin
+// Add custom cron schedules
 function pdf_search_indexer_add_cron_schedules($schedules) {
-    // Add a 'every_three_days' schedule if it doesn't exist
+    // Add a 5-minute schedule for the watchdog
+    if (!isset($schedules['every_five_minutes'])) {
+        $schedules['every_five_minutes'] = array(
+            'interval' => 300,
+            'display'  => __('Every 5 Minutes', 'pdf-search-indexer'),
+        );
+    }
+    // Keep the existing 3-day schedule (if used elsewhere)
     if (!isset($schedules['every_three_days'])) {
         $schedules['every_three_days'] = array(
             'interval' => 259200, // 3 days in seconds

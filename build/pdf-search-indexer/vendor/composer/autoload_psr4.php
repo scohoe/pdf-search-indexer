@@ -7,5 +7,4 @@ $baseDir = dirname($vendorDir);
 
 return array(
     'Symfony\\Polyfill\\Mbstring\\' => array($vendorDir . '/symfony/polyfill-mbstring'),
-    'PDFSearchIndexer\\' => array($baseDir . '/src'),
 );
